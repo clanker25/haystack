@@ -1,0 +1,606 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import logging
+from datetime import datetime
+from enum import Enum
+
+import pydantic
+import pytest
+
+from haystack.core.errors import DeserializationError, SerializationError
+from haystack.dataclasses import ChatMessage, Document, GeneratedAnswer
+from haystack.utils.base_serialization import (
+    _deserialize_value_with_schema,
+    _serialize_value_with_schema,
+    _serialize_with_field_fallback,
+)
+
+
+class PlainObject:
+    """An arbitrary object without a ``to_dict`` method (only a `__dict__`)."""
+
+    def __init__(self, value):
+        self.value = value
+
+
+class CustomModel(pydantic.BaseModel):
+    id: int
+    name: str
+
+
+class CustomEnum(Enum):
+    ONE = "one"
+    TWO = "two"
+
+
+def simple_calc_function(x: int) -> int:
+    return x * 2
+
+
+@pytest.mark.parametrize(
+    "value,result",
+    [
+        # integer
+        (1, {"serialization_schema": {"type": "integer"}, "serialized_data": 1}),
+        # float
+        (1.5, {"serialization_schema": {"type": "number"}, "serialized_data": 1.5}),
+        # string
+        ("test", {"serialization_schema": {"type": "string"}, "serialized_data": "test"}),
+        # boolean
+        (True, {"serialization_schema": {"type": "boolean"}, "serialized_data": True}),
+        (False, {"serialization_schema": {"type": "boolean"}, "serialized_data": False}),
+        # None
+        (None, {"serialization_schema": {"type": "null"}, "serialized_data": None}),
+    ],
+)
+def test_serialize_and_deserialize_primitive_types(value, result):
+    assert _serialize_value_with_schema(value) == result
+    assert _deserialize_value_with_schema(result) == value
+
+
+@pytest.mark.parametrize(
+    "value,result",
+    [
+        # empty dict
+        ({}, {"serialization_schema": {"type": "object", "properties": {}}, "serialized_data": {}}),
+        # empty list
+        ([], {"serialization_schema": {"type": "array", "items": {}}, "serialized_data": []}),
+        # empty tuple
+        (
+            (),
+            {
+                "serialization_schema": {"type": "array", "items": {}, "minItems": 0, "maxItems": 0},
+                "serialized_data": [],
+            },
+        ),
+        # empty set
+        (set(), {"serialization_schema": {"type": "array", "items": {}, "uniqueItems": True}, "serialized_data": []}),
+        # nested empty structures
+        (
+            {"empty_list": [], "empty_dict": {}, "nested_empty": {"empty": []}},
+            {
+                "serialization_schema": {
+                    "type": "object",
+                    "properties": {
+                        "empty_list": {"type": "array", "items": {}},
+                        "empty_dict": {"type": "object", "properties": {}},
+                        "nested_empty": {"type": "object", "properties": {"empty": {"type": "array", "items": {}}}},
+                    },
+                },
+                "serialized_data": {"empty_list": [], "empty_dict": {}, "nested_empty": {"empty": []}},
+            },
+        ),
+    ],
+)
+def test_serializing_and_deserializing_empty_structures(value, result):
+    assert _serialize_value_with_schema(value) == result
+    assert _deserialize_value_with_schema(result) == value
+
+
+@pytest.mark.parametrize(
+    "value,result",
+    [
+        # list
+        (
+            [1, 2, 3],
+            {"serialization_schema": {"type": "array", "items": {"type": "integer"}}, "serialized_data": [1, 2, 3]},
+        ),
+        # set
+        (
+            {1, 2, 3},
+            {
+                "serialization_schema": {"type": "array", "items": {"type": "integer"}, "uniqueItems": True},
+                "serialized_data": [1, 2, 3],
+            },
+        ),
+        # frozenset
+        (
+            frozenset({1, 2, 3}),
+            {
+                "serialization_schema": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "uniqueItems": True,
+                    "frozen": True,
+                },
+                "serialized_data": [1, 2, 3],
+            },
+        ),
+        # tuple
+        (
+            (1, 2, 3),
+            {
+                "serialization_schema": {"type": "array", "items": {"type": "integer"}, "minItems": 3, "maxItems": 3},
+                "serialized_data": [1, 2, 3],
+            },
+        ),
+        # nested list
+        (
+            [[1, 2], [3, 4]],
+            {
+                "serialization_schema": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}},
+                "serialized_data": [[1, 2], [3, 4]],
+            },
+        ),
+        # list of set
+        (
+            [{1, 2}, {3, 4}],
+            {
+                "serialization_schema": {
+                    "items": {"items": {"type": "integer"}, "type": "array", "uniqueItems": True},
+                    "type": "array",
+                },
+                "serialized_data": [[1, 2], [3, 4]],
+            },
+        ),
+        # nested tuple
+        (
+            ((1, 2), (3, 4), (5, 6)),
+            {
+                "serialization_schema": {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                    "minItems": 3,
+                    "maxItems": 3,
+                },
+                "serialized_data": [[1, 2], [3, 4], [5, 6]],
+            },
+        ),
+        # nested list of GeneratedAnswer
+        (
+            [
+                [
+                    GeneratedAnswer(
+                        data="Paris",
+                        query="What is the capital of France?",
+                        documents=[Document(content="Paris is the capital of France", id="1")],
+                        meta={"page": 1},
+                    )
+                ],
+                [
+                    GeneratedAnswer(
+                        data="Berlin",
+                        query="What is the capital of Germany?",
+                        documents=[Document(content="Berlin is the capital of Germany", id="2")],
+                        meta={"page": 1},
+                    )
+                ],
+            ],
+            {
+                "serialization_schema": {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "haystack.dataclasses.answer.GeneratedAnswer"}},
+                },
+                "serialized_data": [
+                    [
+                        {
+                            "data": "Paris",
+                            "query": "What is the capital of France?",
+                            "documents": [
+                                {
+                                    "id": "1",
+                                    "content": "Paris is the capital of France",
+                                    "blob": None,
+                                    "meta": {},
+                                    "score": None,
+                                    "embedding": None,
+                                    "sparse_embedding": None,
+                                    "multivector_embedding": None,
+                                }
+                            ],
+                            "meta": {"page": 1},
+                        }
+                    ],
+                    [
+                        {
+                            "data": "Berlin",
+                            "query": "What is the capital of Germany?",
+                            "documents": [
+                                {
+                                    "id": "2",
+                                    "content": "Berlin is the capital of Germany",
+                                    "blob": None,
+                                    "meta": {},
+                                    "score": None,
+                                    "embedding": None,
+                                    "sparse_embedding": None,
+                                    "multivector_embedding": None,
+                                }
+                            ],
+                            "meta": {"page": 1},
+                        }
+                    ],
+                ],
+            },
+        ),
+    ],
+)
+def test_serialize_and_deserialize_sequence_types(value, result):
+    assert _serialize_value_with_schema(value) == result
+    deserialized = _deserialize_value_with_schema(result)
+    assert deserialized == value
+    # `frozenset({...}) == set({...})` is True, so check the exact type to catch container regressions.
+    assert type(deserialized) is type(value)
+
+
+@pytest.mark.parametrize(
+    "value,result",
+    [
+        pytest.param(
+            {"key1": {"nested1": "value1", "nested2": {"deep": "value2"}}},
+            {
+                "serialization_schema": {
+                    "type": "object",
+                    "properties": {
+                        "key1": {
+                            "type": "object",
+                            "properties": {
+                                "nested1": {"type": "string"},
+                                "nested2": {"type": "object", "properties": {"deep": {"type": "string"}}},
+                            },
+                        }
+                    },
+                },
+                "serialized_data": {"key1": {"nested1": "value1", "nested2": {"deep": "value2"}}},
+            },
+            id="nested-dicts",
+        ),
+        pytest.param(
+            simple_calc_function,
+            {
+                "serialization_schema": {"type": "typing.Callable"},
+                "serialized_data": "test_base_serialization.simple_calc_function",
+            },
+            id="callable",
+        ),
+        pytest.param(
+            CustomEnum.ONE,
+            {"serialization_schema": {"type": "test_base_serialization.CustomEnum"}, "serialized_data": "ONE"},
+            id="enum",
+        ),
+        pytest.param(
+            CustomModel(id=1, name="Test"),
+            {
+                "serialization_schema": {"type": "test_base_serialization.CustomModel"},
+                "serialized_data": {"id": 1, "name": "Test"},
+            },
+            id="pydantic-model",
+        ),
+    ],
+)
+def test_serialize_and_deserialize_complex_types(value, result):
+    assert _serialize_value_with_schema(value) == result
+    assert _deserialize_value_with_schema(result) == value
+
+
+def test_serialize_and_deserialize_value_with_schema_with_various_types():
+    data = {
+        "numbers": 1,
+        "key_name": None,
+        "messages": [ChatMessage.from_user(text="Hello, world!"), ChatMessage.from_assistant(text="Hello, world!")],
+        "user_id": "123",
+        "dict_of_lists": {"numbers": [1, 2, 3]},
+        "documents": [Document(content="Hello, world!", id="1")],
+        "list_of_dicts": [{"numbers": [1, 2, 3]}],
+        "answers": [
+            GeneratedAnswer(
+                data="Paris",
+                query="What is the capital of France?",
+                documents=[Document(content="Paris is the capital of France", id="2")],
+                meta={"page": 1},
+            )
+        ],
+    }
+    expected = {
+        "serialization_schema": {
+            "type": "object",
+            "properties": {
+                "numbers": {"type": "integer"},
+                "key_name": {"type": "null"},
+                "messages": {"type": "array", "items": {"type": "haystack.dataclasses.chat_message.ChatMessage"}},
+                "user_id": {"type": "string"},
+                "dict_of_lists": {
+                    "type": "object",
+                    "properties": {"numbers": {"type": "array", "items": {"type": "integer"}}},
+                },
+                "documents": {"type": "array", "items": {"type": "haystack.dataclasses.document.Document"}},
+                "list_of_dicts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"numbers": {"type": "array", "items": {"type": "integer"}}},
+                    },
+                },
+                "answers": {"type": "array", "items": {"type": "haystack.dataclasses.answer.GeneratedAnswer"}},
+            },
+        },
+        "serialized_data": {
+            "numbers": 1,
+            "key_name": None,
+            "messages": [
+                {"role": "user", "meta": {}, "name": None, "content": [{"text": "Hello, world!"}]},
+                {"role": "assistant", "meta": {}, "name": None, "content": [{"text": "Hello, world!"}]},
+            ],
+            "user_id": "123",
+            "dict_of_lists": {"numbers": [1, 2, 3]},
+            "documents": [
+                {
+                    "id": "1",
+                    "content": "Hello, world!",
+                    "blob": None,
+                    "score": None,
+                    "embedding": None,
+                    "sparse_embedding": None,
+                    "multivector_embedding": None,
+                }
+            ],
+            "list_of_dicts": [{"numbers": [1, 2, 3]}],
+            "answers": [
+                {
+                    "data": "Paris",
+                    "query": "What is the capital of France?",
+                    "documents": [
+                        {
+                            "id": "2",
+                            "content": "Paris is the capital of France",
+                            "blob": None,
+                            "meta": {},
+                            "score": None,
+                            "embedding": None,
+                            "sparse_embedding": None,
+                            "multivector_embedding": None,
+                        }
+                    ],
+                    "meta": {"page": 1},
+                }
+            ],
+        },
+    }
+    assert _serialize_value_with_schema(data) == expected
+    assert _deserialize_value_with_schema(expected) == data
+
+
+class TestMixedTypeArrays:
+    """Mixed-type arrays keep one schema per position under `prefixItems`."""
+
+    def test_serialize_mixed_primitives(self):
+        assert _serialize_value_with_schema({"y": [1, "a", {"k": 2}]}) == {
+            "serialization_schema": {
+                "type": "object",
+                "properties": {
+                    "y": {
+                        "type": "array",
+                        "prefixItems": [
+                            {"type": "integer"},
+                            {"type": "string"},
+                            {"type": "object", "properties": {"k": {"type": "integer"}}},
+                        ],
+                    }
+                },
+            },
+            "serialized_data": {"y": [1, "a", {"k": 2}]},
+        }
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param({"y": [1, "a", {"k": 2}]}, id="mixed-primitives"),
+            pytest.param({"x": [Document(content="a", id="1"), "plain string", 3]}, id="object-and-primitives"),
+            pytest.param({"t": (1, "a", Document(content="a", id="1"))}, id="mixed-tuple"),
+            pytest.param({"n": [[1, "a"], [Document(content="a", id="1"), None]]}, id="nested-mixed-lists"),
+            pytest.param({"e": []}, id="empty-list"),
+            pytest.param({"m": [1, None, True, 2.5, "s"]}, id="all-primitive-kinds"),
+        ],
+    )
+    def test_round_trip_mixed_arrays(self, value):
+        deserialized = _deserialize_value_with_schema(_serialize_value_with_schema(value))
+        assert deserialized == value
+        for key, original in value.items():
+            assert type(deserialized[key]) is type(original)
+
+    def test_round_trip_mixed_set(self):
+        value = {1, "a", None}
+        deserialized = _deserialize_value_with_schema(_serialize_value_with_schema(value))
+        assert deserialized == value
+        assert type(deserialized) is set
+
+    def test_round_trip_mixed_frozenset(self):
+        value = frozenset({1, "a", None})
+        deserialized = _deserialize_value_with_schema(_serialize_value_with_schema(value))
+        assert deserialized == value
+        assert type(deserialized) is frozenset
+
+    def test_homogeneous_output_is_unchanged(self):
+        # Backward compatibility: homogeneous arrays keep the historical `items` envelope.
+        document = Document(content="a", id="1")
+        assert _serialize_value_with_schema({"docs": [document], "nums": (1, 2)}) == {
+            "serialization_schema": {
+                "type": "object",
+                "properties": {
+                    "docs": {"type": "array", "items": {"type": "haystack.dataclasses.document.Document"}},
+                    "nums": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                },
+            },
+            "serialized_data": {"docs": [document.to_dict()], "nums": [1, 2]},
+        }
+
+    def test_deserialize_old_format_with_only_items(self):
+        # Payloads written before `prefixItems` existed still deserialize through `items`.
+        assert _deserialize_value_with_schema(
+            {"serialization_schema": {"type": "array", "items": {"type": "integer"}}, "serialized_data": [1, 2, 3]}
+        ) == [1, 2, 3]
+
+    def test_deserialize_prefix_items_length_mismatch_raises(self):
+        with pytest.raises(DeserializationError, match="'prefixItems' declares 2 element schemas"):
+            _deserialize_value_with_schema(
+                {
+                    "serialization_schema": {"type": "array", "prefixItems": [{"type": "integer"}, {"type": "string"}]},
+                    "serialized_data": [1],
+                }
+            )
+
+
+class TestNonStringKeys:
+    """Dicts with non-string keys keep their key types across a JSON round-trip.
+
+    JSON object keys must be strings, so without the `entries` encoding an int key would come
+    back as a string, and keys that stringify alike would collide. The JSON round-trip below is
+    essential: an in-memory serialize/deserialize keeps the keys by accident.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param({1: "a", 2: "b"}, id="int-keys"),
+            pytest.param({1.5: "x", 2.5: "y"}, id="float-keys"),
+            pytest.param({True: "yes", False: "no"}, id="bool-keys"),
+            pytest.param({None: "nothing"}, id="none-key"),
+            pytest.param({1: "a", "x": "b"}, id="mixed-string-and-int-keys"),
+            pytest.param({"outer": {1: "a"}}, id="nested-int-keys"),
+            pytest.param({(1, 2): "tuple-key"}, id="tuple-key"),
+            pytest.param({1: "int", "1": "str"}, id="stringified-collision-preserved"),
+        ],
+    )
+    def test_round_trip_through_json(self, value):
+        serialized = _serialize_value_with_schema(value)
+        through_json = json.loads(json.dumps(serialized))
+        deserialized = _deserialize_value_with_schema(through_json)
+        assert deserialized == value
+        assert [type(k) for k in deserialized] == [type(k) for k in value]
+
+    def test_string_keyed_dict_output_is_unchanged(self):
+        # Backward compatibility: dicts with only string keys keep the historical `properties`
+        # envelope, with no `entries` keyword — not even when a field is literally named "entries".
+        assert _serialize_value_with_schema({"a": 1, "entries": 2}) == {
+            "serialization_schema": {
+                "type": "object",
+                "properties": {"a": {"type": "integer"}, "entries": {"type": "integer"}},
+            },
+            "serialized_data": {"a": 1, "entries": 2},
+        }
+
+    def test_deserialize_entries_length_mismatch_raises(self):
+        with pytest.raises(DeserializationError, match="'entries' declares 2"):
+            _deserialize_value_with_schema(
+                {
+                    "serialization_schema": {
+                        "type": "object",
+                        "entries": [
+                            {"key": {"type": "integer"}, "value": {"type": "string"}},
+                            {"key": {"type": "integer"}, "value": {"type": "string"}},
+                        ],
+                    },
+                    "serialized_data": [{"key": 1, "value": "a"}],
+                }
+            )
+
+    def test_field_fallback_preserves_non_string_keys_through_json(self):
+        # A dict with non-string keys AND a value that cannot be serialized: the field-by-field
+        # fallback omits only the failing field and still keeps the key types of the surviving
+        # fields across a real JSON round-trip.
+        payload = {1: "a", 2: PlainObject("unserializable"), "keep": "me"}
+
+        serialized = _serialize_with_field_fallback(payload, description="the test payload")
+        deserialized = _deserialize_value_with_schema(json.loads(json.dumps(serialized)))
+
+        assert deserialized == {1: "a", "keep": "me"}
+        assert [type(k) for k in deserialized] == [int, str]
+
+    def test_field_fallback_omits_field_with_unserializable_key(self, caplog):
+        payload = {PlainObject("bad-key"): "dropped", 1: "a", "keep": "me"}
+
+        with caplog.at_level(logging.WARNING):
+            serialized = _serialize_with_field_fallback(payload, description="the test payload")
+        deserialized = _deserialize_value_with_schema(json.loads(json.dumps(serialized)))
+
+        assert deserialized == {1: "a", "keep": "me"}
+        assert [type(k) for k in deserialized] == [int, str]
+        assert any("field of the test payload. The field will be omitted" in msg for msg in caplog.messages)
+
+    def test_field_fallback_string_keyed_output_is_unchanged(self):
+        # Backward compatibility: the fallback path for dicts with only string keys (and a
+        # failing value) keeps producing the historical `properties` envelope.
+        serialized = _serialize_with_field_fallback(
+            {"a": 1, "bad": PlainObject("unserializable")}, description="the test payload"
+        )
+
+        assert serialized == {
+            "serialization_schema": {"type": "object", "properties": {"a": {"type": "integer"}}},
+            "serialized_data": {"a": 1},
+        }
+
+
+class TestErrorHandling:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(datetime(2024, 1, 1), id="datetime"),
+            pytest.param(b"some bytes", id="bytes"),
+            pytest.param(3 + 4j, id="complex"),
+            pytest.param(PlainObject(1), id="object-without-to_dict"),
+        ],
+    )
+    def test_serialize_unsupported_type_raises(self, value):
+        with pytest.raises(SerializationError, match="Cannot serialize value of type"):
+            _serialize_value_with_schema(value)
+
+    def test_serialize_unsupported_nested_value_raises(self):
+        # An unsupported value nested inside a supported container must not be silently passed through.
+        with pytest.raises(SerializationError, match="Cannot serialize value of type"):
+            _serialize_value_with_schema({"good": 1, "bad": datetime(2024, 1, 1)})
+
+    def test_deserialize_value_with_wrong_value(self):
+        with pytest.raises(DeserializationError, match="Value 'NOT_VALID' is not a valid member of Enum"):
+            _deserialize_value_with_schema(
+                {"serialization_schema": {"type": "test_base_serialization.CustomEnum"}, "serialized_data": "NOT_VALID"}
+            )
+
+    def test_deserialize_value_with_schema_class_not_importable(self):
+        with pytest.raises(
+            DeserializationError, match="Class 'test_base_serialization.NonExistentClass' not correctly imported"
+        ):
+            _deserialize_value_with_schema(
+                {"serialization_schema": {"type": "test_base_serialization.NonExistentClass"}, "serialized_data": {}}
+            )
+
+    def test_deserialize_value_with_schema_class_name_without_module(self):
+        with pytest.raises(DeserializationError, match="Class 'NonExistentClass' not correctly imported"):
+            _deserialize_value_with_schema(
+                {"serialization_schema": {"type": "NonExistentClass"}, "serialized_data": {}}
+            )
+
+    def test_deserialize_pydantic_model_with_invalid_data(self):
+        with pytest.raises(
+            DeserializationError,
+            match="Failed to deserialize data '{'id': 'not_an_integer', 'name': 'Test'}' into "
+            "Pydantic model 'test_base_serialization.CustomModel'",
+        ):
+            _deserialize_value_with_schema(
+                {
+                    "serialization_schema": {"type": "test_base_serialization.CustomModel"},
+                    "serialized_data": {"id": "not_an_integer", "name": "Test"},
+                }
+            )
